@@ -4,12 +4,17 @@ use crate::scanner::{spawn_scan, ScanConfig, ScanMessage, ScanPhase, ScanProgres
 use crate::treemap::{squarified_treemap, LayoutRect};
 use eframe::egui::{self, Color32};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const ACTION_LOG_CAPACITY: usize = 500;
+const MAX_VISIBLE_LINES: usize = 30;
+const LINE_LIFETIME_SECONDS: f32 = 5.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppMode {
@@ -81,6 +86,75 @@ struct TreemapCache {
     width_px: u32,
     height_px: u32,
     cells: Vec<CachedCell>,
+    cell_centers: HashMap<PathBuf, egui::Pos2>,
+}
+
+#[derive(Debug, Clone)]
+struct ActionLogEntry {
+    timestamp: SystemTime,
+    target_path: PathBuf,
+    action_type: String,
+}
+
+#[derive(Clone, Default)]
+struct ActionLog {
+    entries: Arc<Mutex<VecDeque<ActionLogEntry>>>,
+}
+
+impl ActionLog {
+    fn new() -> Self {
+        Self {
+            entries: Arc::new(Mutex::new(VecDeque::with_capacity(ACTION_LOG_CAPACITY))),
+        }
+    }
+
+    fn push(&self, target_path: PathBuf, action_type: impl Into<String>) {
+        let Ok(mut entries) = self.entries.try_lock() else {
+            return;
+        };
+
+        if entries.len() >= ACTION_LOG_CAPACITY {
+            entries.pop_front();
+        }
+
+        entries.push_back(ActionLogEntry {
+            timestamp: SystemTime::now(),
+            target_path,
+            action_type: action_type.into(),
+        });
+    }
+
+    fn latest(&self) -> Option<ActionLogEntry> {
+        let Ok(entries) = self.entries.try_lock() else {
+            return None;
+        };
+
+        entries.back().cloned()
+    }
+
+    fn len(&self) -> usize {
+        let Ok(entries) = self.entries.try_lock() else {
+            return 0;
+        };
+
+        entries.len()
+    }
+
+    fn clear(&self) {
+        let Ok(mut entries) = self.entries.try_lock() else {
+            return;
+        };
+
+        entries.clear();
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VisualActionLine {
+    timestamp: SystemTime,
+    target_path: PathBuf,
+    opacity: f32,
+    age: f32,
 }
 
 pub struct TreeMapApp {
@@ -105,6 +179,8 @@ pub struct TreeMapApp {
     total_file_bytes: u64,
     legend_top_n: usize,
     alias_map: HashMap<PathBuf, AliasEntry>,
+    action_log: ActionLog,
+    visual_lines: VecDeque<VisualActionLine>,
 }
 
 impl TreeMapApp {
@@ -134,6 +210,8 @@ impl TreeMapApp {
             total_file_bytes: 0,
             legend_top_n: 12,
             alias_map: HashMap::new(),
+            action_log: ActionLog::new(),
+            visual_lines: VecDeque::with_capacity(MAX_VISIBLE_LINES),
         }
     }
 
@@ -206,6 +284,131 @@ impl TreeMapApp {
         }
     }
 
+    fn log_action(&mut self, target_path: PathBuf, action_type: impl Into<String>) {
+        let action_type = action_type.into();
+        self.action_log.push(target_path.clone(), action_type);
+        self.visual_lines.push_back(VisualActionLine {
+            timestamp: SystemTime::now(),
+            target_path,
+            opacity: 1.0,
+            age: 0.0,
+        });
+        while self.visual_lines.len() > MAX_VISIBLE_LINES {
+            self.visual_lines.pop_front();
+        }
+    }
+
+    fn simulate_agent_activity(&mut self) {
+        let Some(cache) = self.treemap_cache.as_ref() else {
+            return;
+        };
+
+        if cache.cells.is_empty() {
+            return;
+        }
+
+        const ACTION_TYPES: [&str; 6] = [
+            "inspect",
+            "classify",
+            "correlate",
+            "trace",
+            "verify",
+            "highlight",
+        ];
+
+        let total = cache.cells.len();
+        let event_count = total.min(6);
+        let mut seed = time_seed();
+        let mut selected = Vec::with_capacity(event_count);
+
+        for offset in 0..event_count {
+            seed = next_seed(seed ^ ((offset as u64 + 1) * 0x9E37_79B9));
+            let index = (seed as usize) % total;
+            let action_type = ACTION_TYPES[(seed as usize) % ACTION_TYPES.len()];
+            if let Some(cell) = cache.cells.get(index) {
+                selected.push((cell.path.clone(), action_type));
+            }
+        }
+
+        for (path, action_type) in selected {
+            self.log_action(path, action_type);
+        }
+    }
+
+    fn update_visual_lines(&mut self, delta_seconds: f32) {
+        let dt = delta_seconds.max(0.0);
+        let now = SystemTime::now();
+
+        for line in &mut self.visual_lines {
+            let age_from_timestamp = now
+                .duration_since(line.timestamp)
+                .unwrap_or(Duration::ZERO)
+                .as_secs_f32();
+            line.age = (line.age + dt).max(age_from_timestamp);
+        }
+
+        while self
+            .visual_lines
+            .front()
+            .map(|line| line.age > LINE_LIFETIME_SECONDS)
+            .unwrap_or(false)
+        {
+            self.visual_lines.pop_front();
+        }
+
+        let total = self.visual_lines.len();
+        for (idx, line) in self.visual_lines.iter_mut().enumerate() {
+            let rank_from_newest = total.saturating_sub(idx + 1);
+            let base_opacity = if rank_from_newest < 10 {
+                1.0
+            } else if rank_from_newest < 20 {
+                0.5
+            } else {
+                0.2
+            };
+            let fade = (1.0 - line.age / LINE_LIFETIME_SECONDS).clamp(0.0, 1.0);
+            line.opacity = base_opacity * fade;
+        }
+    }
+
+    fn render_openclaw_overlay(
+        &self,
+        painter: &egui::Painter,
+        cache: &TreemapCache,
+        canvas_rect: egui::Rect,
+    ) -> bool {
+        let openclaw_pos = canvas_rect.center();
+        painter.circle_filled(openclaw_pos, 6.0, Color32::from_rgb(208, 58, 58));
+        painter.text(
+            openclaw_pos + egui::vec2(8.0, -8.0),
+            egui::Align2::LEFT_BOTTOM,
+            "OpenCLAW",
+            egui::FontId::proportional(12.0),
+            Color32::from_rgb(255, 210, 210),
+        );
+
+        let mut has_visible_line = false;
+        for line in &self.visual_lines {
+            if line.opacity <= 0.0 {
+                continue;
+            }
+
+            let Some(target_pos) = cache.cell_centers.get(&line.target_path) else {
+                continue;
+            };
+
+            let alpha = (line.opacity * 255.0).round().clamp(0.0, 255.0) as u8;
+            let line_color = Color32::from_rgba_unmultiplied(255, 0, 0, alpha);
+            painter.line_segment(
+                [openclaw_pos, *target_pos],
+                egui::Stroke::new(1.0, line_color),
+            );
+            has_visible_line = true;
+        }
+
+        has_visible_line
+    }
+
     fn pick_and_scan(&mut self) {
         if let Some(directory) = rfd::FileDialog::new()
             .set_title(self.t("Select root directory", "选择根目录"))
@@ -227,6 +430,8 @@ impl TreeMapApp {
         self.type_stats.clear();
         self.total_file_bytes = 0;
         self.alias_map.clear();
+        self.action_log.clear();
+        self.visual_lines.clear();
         self.scan_receiver = Some(spawn_scan(root_path, self.scan_config.clone()));
     }
 
@@ -343,6 +548,32 @@ impl TreeMapApp {
             ui.checkbox(&mut self.show_cell_labels, show_labels_text);
             let demo_mode_text = self.t("Demo anonymous mode", "演示匿名模式");
             ui.checkbox(&mut self.demo_mode, demo_mode_text);
+            let simulate_text = self.t("Simulate OpenCLAW", "模拟 OpenCLAW");
+            if ui.button(simulate_text).clicked() {
+                self.simulate_agent_activity();
+            }
+
+            let action_count = self.action_log.len();
+            ui.small(format!(
+                "{} {}",
+                self.t("OpenCLAW actions:", "OpenCLAW 动作："),
+                action_count
+            ));
+
+            if let Some(last_action) = self.action_log.latest() {
+                let age_seconds = SystemTime::now()
+                    .duration_since(last_action.timestamp)
+                    .unwrap_or(Duration::ZERO)
+                    .as_secs_f32();
+                let target_text = self.demo_path(&last_action.target_path);
+                ui.small(format!(
+                    "{} {} ({:.1}s) | {}",
+                    self.t("Last:", "最近："),
+                    last_action.action_type,
+                    age_seconds,
+                    target_text
+                ));
+            }
 
             let language_button = match self.language {
                 Language::English => "中文",
@@ -577,6 +808,7 @@ impl TreeMapApp {
         let raw_cells = squarified_treemap(&scan_result.root, bounds, depth, max_nodes);
 
         let mut cells = Vec::with_capacity(raw_cells.len());
+        let mut cell_centers = HashMap::with_capacity(raw_cells.len());
 
         for cell in raw_cells {
             if cell.depth == 0 {
@@ -592,10 +824,12 @@ impl TreeMapApp {
                 continue;
             }
 
+            let path = cell.node.path.clone();
+            cell_centers.insert(path.clone(), rect.center());
             cells.push(CachedCell {
                 rect,
                 name: cell.node.name.clone(),
-                path: cell.node.path.clone(),
+                path,
                 size: cell.node.size,
                 is_dir: !cell.node.children.is_empty(),
                 fill: color_for_node(cell.node, cell.depth),
@@ -610,6 +844,7 @@ impl TreeMapApp {
             width_px: canvas_rect.width().round().max(1.0) as u32,
             height_px: canvas_rect.height().round().max(1.0) as u32,
             cells,
+            cell_centers,
         }
     }
 
@@ -791,6 +1026,11 @@ impl TreeMapApp {
             }
         }
 
+        let has_active_lines = self.render_openclaw_overlay(&painter, cache, canvas_rect);
+        if has_active_lines {
+            ui.ctx().request_repaint_after(Duration::from_millis(33));
+        }
+
         let hovered_snapshot = if canvas_response.hovered() {
             let pointer_pos = ui.ctx().input(|input| input.pointer.hover_pos());
 
@@ -845,6 +1085,12 @@ impl TreeMapApp {
 
 impl eframe::App for TreeMapApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let delta_seconds = ctx.input(|input| input.stable_dt);
+        self.update_visual_lines(delta_seconds);
+        if !self.visual_lines.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(33));
+        }
+
         if !self.startup_prompted {
             self.startup_prompted = true;
             self.pick_and_scan();
@@ -1074,6 +1320,17 @@ fn stable_hash<T: Hash>(value: &T) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
     hasher.finish()
+}
+
+fn time_seed() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos() as u64,
+        Err(_) => 0xA5A5_5A5A_1234_5678,
+    }
+}
+
+fn next_seed(seed: u64) -> u64 {
+    seed.wrapping_mul(6364136223846793005).wrapping_add(1)
 }
 
 fn build_alias_map(root: &Node) -> HashMap<PathBuf, AliasEntry> {
