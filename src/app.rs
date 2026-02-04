@@ -39,6 +39,7 @@ struct HoveredEntry {
     name: String,
     path: PathBuf,
     size: u64,
+    is_dir: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -47,7 +48,20 @@ struct CachedCell {
     name: String,
     path: PathBuf,
     size: u64,
+    is_dir: bool,
     fill: Color32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AliasKind {
+    File,
+    Folder,
+}
+
+#[derive(Debug, Clone)]
+struct AliasEntry {
+    code: String,
+    kind: AliasKind,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +96,7 @@ pub struct TreeMapApp {
     max_render_nodes: usize,
     min_cell_pixels: f32,
     show_cell_labels: bool,
+    demo_mode: bool,
     startup_prompted: bool,
     scan_generation: u64,
     treemap_cache: Option<TreemapCache>,
@@ -89,6 +104,7 @@ pub struct TreeMapApp {
     type_stats: Vec<TypeStat>,
     total_file_bytes: u64,
     legend_top_n: usize,
+    alias_map: HashMap<PathBuf, AliasEntry>,
 }
 
 impl TreeMapApp {
@@ -109,6 +125,7 @@ impl TreeMapApp {
             max_render_nodes: 20_000,
             min_cell_pixels: 1.0,
             show_cell_labels: true,
+            demo_mode: false,
             startup_prompted: false,
             scan_generation: 0,
             treemap_cache: None,
@@ -116,6 +133,7 @@ impl TreeMapApp {
             type_stats: Vec::new(),
             total_file_bytes: 0,
             legend_top_n: 12,
+            alias_map: HashMap::new(),
         }
     }
 
@@ -123,6 +141,68 @@ impl TreeMapApp {
         match self.language {
             Language::English => english,
             Language::Chinese => chinese,
+        }
+    }
+
+    fn demo_name(&self, real_name: &str, path: &PathBuf, is_dir: bool) -> String {
+        if !self.demo_mode {
+            return real_name.to_string();
+        }
+
+        if let Some(alias) = self.alias_map.get(path) {
+            return self.alias_display(alias);
+        }
+
+        if is_dir {
+            self.t("Folder ?", "文件夹 ?").to_string()
+        } else {
+            self.t("File ?", "文件 ?").to_string()
+        }
+    }
+
+    fn demo_path(&self, path: &PathBuf) -> String {
+        if !self.demo_mode {
+            return path.display().to_string();
+        }
+
+        self.alias_path(path)
+    }
+
+    fn alias_display(&self, alias: &AliasEntry) -> String {
+        match alias.kind {
+            AliasKind::File => format!("{}{}", self.t("File ", "文件 "), alias.code),
+            AliasKind::Folder => format!("{}{}", self.t("Folder ", "文件夹 "), alias.code),
+        }
+    }
+
+    fn alias_path(&self, path: &PathBuf) -> String {
+        let Some(root_path) = &self.root_path else {
+            return self.t("(hidden)", "（已隐藏）").to_string();
+        };
+
+        if !path.starts_with(root_path) {
+            return self.t("(hidden)", "（已隐藏）").to_string();
+        }
+
+        let mut parts = Vec::new();
+        if let Some(root_alias) = self.alias_map.get(root_path) {
+            parts.push(self.alias_display(root_alias));
+        }
+
+        if let Ok(relative_path) = path.strip_prefix(root_path) {
+            let mut current = root_path.clone();
+            for component in relative_path.components() {
+                current.push(component.as_os_str());
+                if let Some(alias) = self.alias_map.get(&current) {
+                    parts.push(self.alias_display(alias));
+                }
+            }
+        }
+
+        if parts.is_empty() {
+            self.t("(hidden)", "（已隐藏）").to_string()
+        } else {
+            parts.join(" / ")
         }
     }
 
@@ -146,6 +226,7 @@ impl TreeMapApp {
         self.treemap_cache = None;
         self.type_stats.clear();
         self.total_file_bytes = 0;
+        self.alias_map.clear();
         self.scan_receiver = Some(spawn_scan(root_path, self.scan_config.clone()));
     }
 
@@ -183,6 +264,7 @@ impl TreeMapApp {
                 Ok(result) => {
                     self.treemap_depth = self.treemap_depth.min(self.scan_config.max_depth.max(1));
                     let (type_stats, total_file_bytes) = compute_type_stats(&result.root);
+                    self.alias_map = build_alias_map(&result.root);
                     self.scan_result = Some(result);
                     self.type_stats = type_stats;
                     self.total_file_bytes = total_file_bytes;
@@ -211,11 +293,8 @@ impl TreeMapApp {
             }
 
             if let Some(root) = &self.root_path {
-                ui.label(format!(
-                    "{} {}",
-                    self.t("Root:", "根目录："),
-                    root.display()
-                ));
+                let root_text = self.demo_path(root);
+                ui.label(format!("{} {}", self.t("Root:", "根目录："), root_text));
             } else {
                 ui.label(self.t("Root: (not selected)", "根目录：（未选择）"));
             }
@@ -262,6 +341,8 @@ impl TreeMapApp {
             ui.separator();
             let show_labels_text = self.t("Show labels in cells", "在方块中显示名称");
             ui.checkbox(&mut self.show_cell_labels, show_labels_text);
+            let demo_mode_text = self.t("Demo anonymous mode", "演示匿名模式");
+            ui.checkbox(&mut self.demo_mode, demo_mode_text);
 
             let language_button = match self.language {
                 Language::English => "中文",
@@ -281,14 +362,17 @@ impl TreeMapApp {
             ));
 
             if let Some(hovered) = &self.hovered_entry {
+                let name_text = self.demo_name(&hovered.name, &hovered.path, hovered.is_dir);
+                let path_text = self.demo_path(&hovered.path);
                 ui.separator();
                 ui.small(format!(
                     "{} | {} | {}",
-                    hovered.name,
+                    name_text,
                     human_size(hovered.size),
-                    hovered.path.display()
+                    path_text
                 ));
             } else if let Some(root) = &self.root_path {
+                let root_text = self.demo_path(root);
                 ui.separator();
                 ui.small(format!(
                     "{} {}",
@@ -296,7 +380,7 @@ impl TreeMapApp {
                         "Hover a rectangle to inspect full path. Root:",
                         "把鼠标停在方块上可查看完整路径。根目录："
                     ),
-                    root.display()
+                    root_text
                 ));
             }
         });
@@ -418,10 +502,16 @@ impl TreeMapApp {
             ));
 
             if let Some(path) = &self.scan_progress.current_path {
+                let current_path_text = if self.demo_mode {
+                    self.t("(hidden during scan)", "（扫描中已隐藏）")
+                        .to_string()
+                } else {
+                    path.display().to_string()
+                };
                 ui.small(format!(
                     "{} {}",
                     self.t("Current:", "当前："),
-                    path.display()
+                    current_path_text
                 ));
             }
 
@@ -507,6 +597,7 @@ impl TreeMapApp {
                 name: cell.node.name.clone(),
                 path: cell.node.path.clone(),
                 size: cell.node.size,
+                is_dir: !cell.node.children.is_empty(),
                 fill: color_for_node(cell.node, cell.depth),
             });
         }
@@ -685,7 +776,8 @@ impl TreeMapApp {
             );
 
             if self.show_cell_labels && cell.rect.width() > 95.0 && cell.rect.height() > 20.0 {
-                let label = format!("{} ({})", cell.name, human_size(cell.size));
+                let label_name = self.demo_name(&cell.name, &cell.path, cell.is_dir);
+                let label = format!("{} ({})", label_name, human_size(cell.size));
                 let max_chars = (cell.rect.width() / 7.0).floor().max(6.0) as usize;
                 let text = truncate_label(&label, max_chars);
 
@@ -712,6 +804,7 @@ impl TreeMapApp {
                         name: cell.name.clone(),
                         path: cell.path.clone(),
                         size: cell.size,
+                        is_dir: cell.is_dir,
                     })
             })
         } else {
@@ -727,23 +820,23 @@ impl TreeMapApp {
                 ui.layer_id(),
                 egui::Id::new("treemap_hover"),
                 |ui| {
-                    let type_key = file_type_key(&hovered.path);
-                    ui.label(format!("{} {}", self.t("Name:", "名称："), hovered.name));
-                    ui.label(format!(
-                        "{} {}",
-                        self.t("Type:", "类型："),
+                    ui.set_min_width(420.0);
+                    let type_text = if hovered.is_dir {
+                        self.t("Folder", "文件夹").to_string()
+                    } else {
+                        let type_key = file_type_key(&hovered.path);
                         format_type_key(&type_key, self.language)
-                    ));
+                    };
+                    let name_text = self.demo_name(&hovered.name, &hovered.path, hovered.is_dir);
+                    let path_text = self.demo_path(&hovered.path);
+                    ui.label(format!("{} {}", self.t("Name:", "名称："), name_text));
+                    ui.label(format!("{} {}", self.t("Type:", "类型："), type_text));
                     ui.label(format!(
                         "{} {}",
                         self.t("Size:", "大小："),
                         human_size(hovered.size)
                     ));
-                    ui.label(format!(
-                        "{} {}",
-                        self.t("Path:", "路径："),
-                        hovered.path.display()
-                    ));
+                    ui.label(format!("{} {}", self.t("Path:", "路径："), path_text));
                 },
             );
         }
@@ -981,6 +1074,59 @@ fn stable_hash<T: Hash>(value: &T) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
     hasher.finish()
+}
+
+fn build_alias_map(root: &Node) -> HashMap<PathBuf, AliasEntry> {
+    let mut alias_map = HashMap::new();
+    let mut file_counter = 0_usize;
+    let mut folder_counter = 0_usize;
+    assign_alias(
+        root,
+        true,
+        &mut alias_map,
+        &mut file_counter,
+        &mut folder_counter,
+    );
+    alias_map
+}
+
+fn assign_alias(
+    node: &Node,
+    is_root: bool,
+    alias_map: &mut HashMap<PathBuf, AliasEntry>,
+    file_counter: &mut usize,
+    folder_counter: &mut usize,
+) {
+    let is_dir = is_root || !node.children.is_empty();
+    let (kind, code) = if is_dir {
+        let index = *folder_counter;
+        *folder_counter = folder_counter.saturating_add(1);
+        (AliasKind::Folder, alphabet_code(index))
+    } else {
+        let index = *file_counter;
+        *file_counter = file_counter.saturating_add(1);
+        (AliasKind::File, alphabet_code(index))
+    };
+
+    alias_map.insert(node.path.clone(), AliasEntry { code, kind });
+
+    for child in &node.children {
+        assign_alias(child, false, alias_map, file_counter, folder_counter);
+    }
+}
+
+fn alphabet_code(mut index: usize) -> String {
+    // 0 -> A, 25 -> Z, 26 -> AA
+    let mut chars = Vec::new();
+    loop {
+        let rem = (index % 26) as u8;
+        chars.push((b'A' + rem) as char);
+        if index < 26 {
+            break;
+        }
+        index = index / 26 - 1;
+    }
+    chars.iter().rev().collect()
 }
 
 fn truncate_label(text: &str, max_chars: usize) -> String {
