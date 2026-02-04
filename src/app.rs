@@ -4,6 +4,7 @@ use crate::scanner::{spawn_scan, ScanConfig, ScanMessage, ScanPhase, ScanProgres
 use crate::treemap::{squarified_treemap, LayoutRect};
 use eframe::egui::{self, Color32};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -50,6 +51,14 @@ struct CachedCell {
 }
 
 #[derive(Debug, Clone)]
+struct TypeStat {
+    key: String,
+    bytes: u64,
+    files: u64,
+    color: Color32,
+}
+
+#[derive(Debug, Clone)]
 struct TreemapCache {
     scan_generation: u64,
     depth: usize,
@@ -77,6 +86,9 @@ pub struct TreeMapApp {
     scan_generation: u64,
     treemap_cache: Option<TreemapCache>,
     hovered_entry: Option<HoveredEntry>,
+    type_stats: Vec<TypeStat>,
+    total_file_bytes: u64,
+    legend_top_n: usize,
 }
 
 impl TreeMapApp {
@@ -101,6 +113,9 @@ impl TreeMapApp {
             scan_generation: 0,
             treemap_cache: None,
             hovered_entry: None,
+            type_stats: Vec::new(),
+            total_file_bytes: 0,
+            legend_top_n: 12,
         }
     }
 
@@ -129,6 +144,8 @@ impl TreeMapApp {
         self.scan_progress = ScanProgress::default();
         self.hovered_entry = None;
         self.treemap_cache = None;
+        self.type_stats.clear();
+        self.total_file_bytes = 0;
         self.scan_receiver = Some(spawn_scan(root_path, self.scan_config.clone()));
     }
 
@@ -165,7 +182,10 @@ impl TreeMapApp {
             match result {
                 Ok(result) => {
                     self.treemap_depth = self.treemap_depth.min(self.scan_config.max_depth.max(1));
+                    let (type_stats, total_file_bytes) = compute_type_stats(&result.root);
                     self.scan_result = Some(result);
+                    self.type_stats = type_stats;
+                    self.total_file_bytes = total_file_bytes;
                     self.mode = AppMode::Ready;
                     self.treemap_cache = None;
                 }
@@ -289,6 +309,46 @@ impl TreeMapApp {
             .inner_margin(egui::Margin::same(6.0))
             .show(ui, |ui| {
                 ui.colored_label(Color32::from_rgb(74, 54, 0), message);
+            });
+    }
+
+    fn render_type_legend(&mut self, ui: &mut egui::Ui) {
+        if self.type_stats.is_empty() || self.total_file_bytes == 0 {
+            return;
+        }
+
+        ui.horizontal(|ui| {
+            ui.label(self.t("Top N types:", "前 N 个类型："));
+            ui.add(
+                egui::DragValue::new(&mut self.legend_top_n)
+                    .range(3..=30)
+                    .speed(0.2),
+            );
+        });
+
+        egui::CollapsingHeader::new(self.t("Type Legend", "类型图例"))
+            .default_open(true)
+            .show(ui, |ui| {
+                let count = self.legend_top_n.min(self.type_stats.len());
+                for stat in self.type_stats.iter().take(count) {
+                    let ratio = stat.bytes as f32 / self.total_file_bytes as f32;
+                    let percent = ratio * 100.0;
+
+                    ui.horizontal(|ui| {
+                        let (swatch_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                        ui.painter().rect_filled(swatch_rect, 2.0, stat.color);
+
+                        ui.label(format_type_key(&stat.key, self.language));
+                        ui.add(
+                            egui::ProgressBar::new(ratio.clamp(0.0, 1.0))
+                                .desired_width(160.0)
+                                .text(format!("{percent:.1}%")),
+                        );
+                        ui.label(human_size(stat.bytes));
+                        ui.small(format!("{} {}", stat.files, self.t("files", "个文件")));
+                    });
+                }
             });
     }
 
@@ -570,6 +630,8 @@ impl TreeMapApp {
             );
         });
 
+        self.render_type_legend(ui);
+
         ui.add_space(4.0);
 
         if !has_readable_files {
@@ -665,7 +727,13 @@ impl TreeMapApp {
                 ui.layer_id(),
                 egui::Id::new("treemap_hover"),
                 |ui| {
+                    let type_key = file_type_key(&hovered.path);
                     ui.label(format!("{} {}", self.t("Name:", "名称："), hovered.name));
+                    ui.label(format!(
+                        "{} {}",
+                        self.t("Type:", "类型："),
+                        format_type_key(&type_key, self.language)
+                    ));
                     ui.label(format!(
                         "{} {}",
                         self.t("Size:", "大小："),
@@ -742,76 +810,160 @@ fn format_duration_compact(duration: Duration) -> String {
 fn configure_fonts_for_cjk(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
-    if let Some((font_name, font_data)) = load_system_cjk_font() {
+    let loaded_fonts = load_system_cjk_fonts();
+    let mut loaded_font_names = Vec::with_capacity(loaded_fonts.len());
+
+    for (font_name, font_data) in loaded_fonts {
         fonts.font_data.insert(
             font_name.clone(),
             egui::FontData::from_owned(font_data).into(),
         );
+        loaded_font_names.push(font_name);
+    }
 
+    if !loaded_font_names.is_empty() {
+        // Insert in reverse so the first candidate keeps highest priority.
         if let Some(proportional) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-            proportional.insert(0, font_name.clone());
+            for font_name in loaded_font_names.iter().rev() {
+                proportional.insert(0, font_name.clone());
+            }
         }
 
         if let Some(monospace) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
-            monospace.push(font_name);
+            for font_name in loaded_font_names.iter().rev() {
+                monospace.insert(0, font_name.clone());
+            }
         }
     }
 
     ctx.set_fonts(fonts);
 }
 
-fn load_system_cjk_font() -> Option<(String, Vec<u8>)> {
+fn load_system_cjk_fonts() -> Vec<(String, Vec<u8>)> {
+    let mut loaded = Vec::new();
     let candidates = [
+        // Prefer plain TTF fonts for maximum compatibility in egui.
         ("NotoSansTC", "C:\\Windows\\Fonts\\NotoSansTC-VF.ttf"),
         ("NotoSansHK", "C:\\Windows\\Fonts\\NotoSansHK-VF.ttf"),
-        ("MicrosoftJhengHei", "C:\\Windows\\Fonts\\msjh.ttc"),
-        ("MicrosoftYaHei", "C:\\Windows\\Fonts\\msyh.ttc"),
-        ("KaiU", "C:\\Windows\\Fonts\\kaiu.ttf"),
+        ("SimSunExtG", "C:\\Windows\\Fonts\\SimsunExtG.ttf"),
         ("SimSunBold", "C:\\Windows\\Fonts\\simsunb.ttf"),
+        ("KaiU", "C:\\Windows\\Fonts\\kaiu.ttf"),
     ];
 
     for (name, path) in candidates {
         if let Ok(bytes) = fs::read(path) {
-            return Some((name.to_string(), bytes));
+            loaded.push((name.to_string(), bytes));
         }
     }
 
-    None
+    loaded
+}
+
+fn compute_type_stats(root: &Node) -> (Vec<TypeStat>, u64) {
+    let mut map: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut total_file_bytes = 0_u64;
+    collect_type_stats(root, &mut map, &mut total_file_bytes);
+
+    let mut stats: Vec<TypeStat> = map
+        .into_iter()
+        .map(|(key, (bytes, files))| TypeStat {
+            color: color_for_type_key(&key),
+            key,
+            bytes,
+            files,
+        })
+        .collect();
+
+    stats.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.key.cmp(&b.key)));
+    (stats, total_file_bytes)
+}
+
+fn collect_type_stats(
+    node: &Node,
+    map: &mut HashMap<String, (u64, u64)>,
+    total_file_bytes: &mut u64,
+) {
+    if node.children.is_empty() {
+        let key = file_type_key(&node.path);
+        let entry = map.entry(key).or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(node.size);
+        entry.1 = entry.1.saturating_add(1);
+        *total_file_bytes = total_file_bytes.saturating_add(node.size);
+        return;
+    }
+
+    for child in &node.children {
+        collect_type_stats(child, map, total_file_bytes);
+    }
+}
+
+fn format_type_key(key: &str, language: Language) -> String {
+    if key == "(no_ext)" {
+        return match language {
+            Language::English => "(no extension)".to_string(),
+            Language::Chinese => "（无扩展名）".to_string(),
+        };
+    }
+
+    format!(".{key}")
 }
 
 fn color_for_node(node: &Node, depth: usize) -> Color32 {
     if !node.children.is_empty() {
-        let hash = stable_hash(&node.path);
-        let hue = (hash % 360) as f32 / 360.0;
-        let value = (0.72 - depth as f32 * 0.03).clamp(0.38, 0.78);
-        return Color32::from(egui::ecolor::Hsva::new(hue, 0.35, value, 1.0));
+        return folder_color(depth);
     }
 
-    let extension = node
-        .path
-        .extension()
+    let key = file_type_key(&node.path);
+    let base = color_for_type_key(&key);
+    shade_color(base, depth)
+}
+
+fn folder_color(depth: usize) -> Color32 {
+    shade_color(Color32::from_rgb(72, 78, 86), depth)
+}
+
+fn file_type_key(path: &std::path::Path) -> String {
+    path.extension()
         .and_then(|value| value.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "(no_ext)".to_string())
+}
 
-    let base_color = match extension.as_str() {
-        "rs" | "c" | "cpp" | "h" | "hpp" | "py" | "js" | "ts" | "java" | "go" | "swift" | "cs"
-        | "kt" | "scala" | "toml" | "json" | "yaml" | "yml" | "xml" => {
-            Color32::from_rgb(58, 118, 168)
-        }
-        "md" | "txt" | "pdf" | "doc" | "docx" | "rtf" | "odt" | "xls" | "xlsx" | "csv" | "ppt"
-        | "pptx" => Color32::from_rgb(102, 140, 87),
-        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg" | "ico" => {
-            Color32::from_rgb(145, 103, 160)
-        }
-        "mp4" | "mov" | "avi" | "mkv" | "webm" => Color32::from_rgb(186, 98, 86),
-        "mp3" | "wav" | "flac" | "aac" | "ogg" => Color32::from_rgb(189, 150, 71),
-        "zip" | "7z" | "rar" | "tar" | "gz" | "bz2" | "xz" => Color32::from_rgb(122, 106, 76),
-        "exe" | "dll" | "msi" | "so" | "dylib" | "bin" => Color32::from_rgb(160, 72, 72),
-        _ => Color32::from_rgb(108, 114, 123),
-    };
+fn color_for_type_key(key: &str) -> Color32 {
+    if key == "(no_ext)" {
+        return Color32::from_rgb(122, 128, 136);
+    }
 
-    shade_color(base_color, depth)
+    const PALETTE: [Color32; 24] = [
+        Color32::from_rgb(210, 96, 96),
+        Color32::from_rgb(214, 127, 78),
+        Color32::from_rgb(196, 151, 72),
+        Color32::from_rgb(153, 171, 72),
+        Color32::from_rgb(106, 175, 87),
+        Color32::from_rgb(79, 177, 120),
+        Color32::from_rgb(74, 173, 153),
+        Color32::from_rgb(73, 166, 179),
+        Color32::from_rgb(76, 152, 194),
+        Color32::from_rgb(88, 137, 204),
+        Color32::from_rgb(109, 124, 209),
+        Color32::from_rgb(128, 112, 207),
+        Color32::from_rgb(149, 104, 197),
+        Color32::from_rgb(173, 98, 185),
+        Color32::from_rgb(191, 95, 166),
+        Color32::from_rgb(201, 96, 143),
+        Color32::from_rgb(210, 106, 124),
+        Color32::from_rgb(171, 126, 98),
+        Color32::from_rgb(144, 140, 101),
+        Color32::from_rgb(111, 146, 114),
+        Color32::from_rgb(95, 147, 133),
+        Color32::from_rgb(101, 142, 152),
+        Color32::from_rgb(112, 132, 165),
+        Color32::from_rgb(130, 121, 167),
+    ];
+
+    let index = (stable_hash(&key) % PALETTE.len() as u64) as usize;
+    PALETTE[index]
 }
 
 fn shade_color(base: Color32, depth: usize) -> Color32 {
