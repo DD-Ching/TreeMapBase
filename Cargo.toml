@@ -1,0 +1,14 @@
+[package]
+name = "tree-map-base"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Read-only disk usage treemap visualizer built with Rust and egui"
+readme = "README.md"
+repository = "https://github.com/DD-Ching/TreeMapBase"
+
+[dependencies]
+eframe = "0.29"
+egui = "0.29"
+rfd = "0.15"
+walkdir = "2.5"
