@@ -15,6 +15,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const ACTION_LOG_CAPACITY: usize = 500;
 const MAX_VISIBLE_LINES: usize = 30;
 const LINE_LIFETIME_SECONDS: f32 = 5.0;
+const MIN_ZOOM_FACTOR: f32 = 0.2;
+const MAX_ZOOM_FACTOR: f32 = 10.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppMode {
@@ -83,10 +85,12 @@ struct TreemapCache {
     depth: usize,
     max_nodes: usize,
     min_cell_pixels: f32,
+    canvas_min: egui::Pos2,
     width_px: u32,
     height_px: u32,
     cells: Vec<CachedCell>,
     cell_centers: HashMap<PathBuf, egui::Pos2>,
+    cell_centers_by_key: HashMap<String, egui::Pos2>,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +164,7 @@ struct VisualActionLine {
 pub struct TreeMapApp {
     mode: AppMode,
     language: Language,
+    agent_path: Option<PathBuf>,
     root_path: Option<PathBuf>,
     scan_config: ScanConfig,
     scan_receiver: Option<Receiver<ScanMessage>>,
@@ -171,6 +176,8 @@ pub struct TreeMapApp {
     min_cell_pixels: f32,
     show_cell_labels: bool,
     demo_mode: bool,
+    zoom_factor: f32,
+    offset: egui::Vec2,
     startup_prompted: bool,
     scan_generation: u64,
     treemap_cache: Option<TreemapCache>,
@@ -191,6 +198,7 @@ impl TreeMapApp {
         Self {
             mode: AppMode::AwaitingDirectory,
             language: Language::English,
+            agent_path: None,
             root_path: None,
             scan_config,
             scan_receiver: None,
@@ -202,6 +210,8 @@ impl TreeMapApp {
             min_cell_pixels: 1.0,
             show_cell_labels: true,
             demo_mode: false,
+            zoom_factor: 1.0,
+            offset: egui::Vec2::ZERO,
             startup_prompted: false,
             scan_generation: 0,
             treemap_cache: None,
@@ -282,6 +292,75 @@ impl TreeMapApp {
         } else {
             parts.join(" / ")
         }
+    }
+
+    fn world_to_screen(&self, position: egui::Pos2) -> egui::Pos2 {
+        egui::pos2(
+            position.x * self.zoom_factor + self.offset.x,
+            position.y * self.zoom_factor + self.offset.y,
+        )
+    }
+
+    fn screen_to_world(&self, position: egui::Pos2) -> egui::Pos2 {
+        let zoom = self.zoom_factor.max(MIN_ZOOM_FACTOR);
+        egui::pos2(
+            (position.x - self.offset.x) / zoom,
+            (position.y - self.offset.y) / zoom,
+        )
+    }
+
+    fn transform_rect_for_view(&self, rect: egui::Rect) -> egui::Rect {
+        egui::Rect::from_min_max(
+            self.world_to_screen(rect.min),
+            self.world_to_screen(rect.max),
+        )
+    }
+
+    fn handle_pan_and_zoom(&mut self, ctx: &egui::Context, canvas_response: &egui::Response) {
+        let middle_drag_delta = ctx.input(|input| {
+            if input.pointer.button_down(egui::PointerButton::Middle) && canvas_response.hovered() {
+                input.pointer.delta()
+            } else {
+                egui::Vec2::ZERO
+            }
+        });
+
+        if middle_drag_delta != egui::Vec2::ZERO {
+            self.offset += middle_drag_delta;
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+
+        if !canvas_response.hovered() {
+            return;
+        }
+
+        let scroll_y = ctx.input(|input| input.raw_scroll_delta.y);
+        if scroll_y.abs() <= f32::EPSILON {
+            return;
+        }
+
+        let old_zoom = self.zoom_factor;
+        let zoom_multiplier = (scroll_y * 0.0015).exp();
+        let new_zoom = (old_zoom * zoom_multiplier).clamp(MIN_ZOOM_FACTOR, MAX_ZOOM_FACTOR);
+
+        if (new_zoom - old_zoom).abs() <= f32::EPSILON {
+            return;
+        }
+
+        if let Some(cursor_pos) = ctx.input(|input| input.pointer.hover_pos()) {
+            // Keep the world point under the cursor fixed while zooming.
+            let world_at_cursor = egui::pos2(
+                (cursor_pos.x - self.offset.x) / old_zoom,
+                (cursor_pos.y - self.offset.y) / old_zoom,
+            );
+            self.offset = egui::vec2(
+                cursor_pos.x - world_at_cursor.x * new_zoom,
+                cursor_pos.y - world_at_cursor.y * new_zoom,
+            );
+        }
+
+        self.zoom_factor = new_zoom;
+        ctx.request_repaint_after(Duration::from_millis(16));
     }
 
     fn log_action(&mut self, target_path: PathBuf, action_type: impl Into<String>) {
@@ -371,13 +450,49 @@ impl TreeMapApp {
         }
     }
 
+    fn resolve_openclaw_world_pos(&self, cache: &TreemapCache) -> Option<egui::Pos2> {
+        let agent_path = self.agent_path.as_ref()?;
+        let agent_key = normalize_path_key(agent_path);
+
+        if let Some(pos) = cache.cell_centers.get(agent_path) {
+            return Some(*pos);
+        }
+
+        if let Some(pos) = cache.cell_centers_by_key.get(&agent_key) {
+            return Some(*pos);
+        }
+
+        let mut candidate = agent_path.clone();
+        while candidate.pop() {
+            if let Some(root) = &self.root_path {
+                if !path_within_root(&candidate, root) {
+                    break;
+                }
+            }
+
+            if let Some(pos) = cache.cell_centers.get(&candidate) {
+                return Some(*pos);
+            }
+
+            let candidate_key = normalize_path_key(&candidate);
+            if let Some(pos) = cache.cell_centers_by_key.get(&candidate_key) {
+                return Some(*pos);
+            }
+        }
+
+        None
+    }
+
     fn render_openclaw_overlay(
         &self,
         painter: &egui::Painter,
         cache: &TreemapCache,
         canvas_rect: egui::Rect,
     ) -> bool {
-        let openclaw_pos = canvas_rect.center();
+        let Some(openclaw_world_pos) = self.resolve_openclaw_world_pos(cache) else {
+            return false;
+        };
+        let openclaw_pos = self.world_to_screen(openclaw_world_pos);
         painter.circle_filled(openclaw_pos, 6.0, Color32::from_rgb(208, 58, 58));
         painter.text(
             openclaw_pos + egui::vec2(8.0, -8.0),
@@ -393,20 +508,31 @@ impl TreeMapApp {
                 continue;
             }
 
-            let Some(target_pos) = cache.cell_centers.get(&line.target_path) else {
+            let Some(target_world_pos) = cache.cell_centers.get(&line.target_path) else {
                 continue;
             };
+            let target_pos = self.world_to_screen(*target_world_pos);
+
+            if !canvas_rect.expand(32.0).contains(target_pos) {
+                continue;
+            }
 
             let alpha = (line.opacity * 255.0).round().clamp(0.0, 255.0) as u8;
             let line_color = Color32::from_rgba_unmultiplied(255, 0, 0, alpha);
             painter.line_segment(
-                [openclaw_pos, *target_pos],
+                [target_pos, openclaw_pos],
                 egui::Stroke::new(1.0, line_color),
             );
             has_visible_line = true;
         }
 
         has_visible_line
+    }
+
+    fn pick_agent_path(&mut self) -> Option<PathBuf> {
+        rfd::FileDialog::new()
+            .set_title(self.t("Select OpenCLAW location", "选择 OpenCLAW 位置"))
+            .pick_folder()
     }
 
     fn pick_and_scan(&mut self) {
@@ -416,6 +542,24 @@ impl TreeMapApp {
         {
             self.start_scan(directory);
         }
+    }
+
+    fn pick_startup_paths_and_scan(&mut self) {
+        let Some(agent_path) = self.pick_agent_path() else {
+            self.mode = AppMode::AwaitingDirectory;
+            return;
+        };
+
+        let Some(root_path) = rfd::FileDialog::new()
+            .set_title(self.t("Select root directory", "选择根目录"))
+            .pick_folder()
+        else {
+            self.mode = AppMode::AwaitingDirectory;
+            return;
+        };
+
+        self.agent_path = Some(agent_path);
+        self.start_scan(root_path);
     }
 
     fn start_scan(&mut self, root_path: PathBuf) {
@@ -491,6 +635,28 @@ impl TreeMapApp {
 
         ui.horizontal_wrapped(|ui| {
             if ui
+                .button(self.t("Select OpenCLAW location...", "选择 OpenCLAW 位置..."))
+                .clicked()
+            {
+                if let Some(path) = self.pick_agent_path() {
+                    self.agent_path = Some(path);
+                    self.visual_lines.clear();
+                }
+            }
+
+            if let Some(agent) = &self.agent_path {
+                let agent_text = self.demo_path(agent);
+                ui.label(format!(
+                    "{} {}",
+                    self.t("OpenCLAW:", "OpenCLAW："),
+                    agent_text
+                ));
+            } else {
+                ui.label(self.t("OpenCLAW: (not selected)", "OpenCLAW：（未选择）"));
+            }
+
+            ui.separator();
+            if ui
                 .button(self.t("Select root directory...", "选择根目录..."))
                 .clicked()
             {
@@ -502,6 +668,18 @@ impl TreeMapApp {
                 ui.label(format!("{} {}", self.t("Root:", "根目录："), root_text));
             } else {
                 ui.label(self.t("Root: (not selected)", "根目录：（未选择）"));
+            }
+
+            if let (Some(agent), Some(root)) = (&self.agent_path, &self.root_path) {
+                if !path_within_root(agent, root) {
+                    ui.colored_label(
+                        Color32::from_rgb(210, 70, 70),
+                        self.t(
+                            "OpenCLAW path is outside root; marker will not be shown.",
+                            "OpenCLAW 路径不在根目录内，无法显示位置。",
+                        ),
+                    );
+                }
             }
 
             ui.separator();
@@ -582,6 +760,17 @@ impl TreeMapApp {
             if ui.button(language_button).clicked() {
                 self.language.toggle();
             }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button(self.t("Reset View", "重置视图"))
+                    .on_hover_text(self.t("Reset pan and zoom", "重置平移与缩放"))
+                    .clicked()
+                {
+                    self.zoom_factor = 1.0;
+                    self.offset = egui::Vec2::ZERO;
+                }
+            });
         });
     }
 
@@ -776,12 +965,13 @@ impl TreeMapApp {
         });
     }
 
-    fn cache_needs_rebuild(&self, width_px: u32, height_px: u32) -> bool {
+    fn cache_needs_rebuild(&self, canvas_min: egui::Pos2, width_px: u32, height_px: u32) -> bool {
         match &self.treemap_cache {
             Some(cache) => {
                 cache.scan_generation != self.scan_generation
                     || cache.depth != self.treemap_depth
                     || cache.max_nodes != self.max_render_nodes
+                    || cache.canvas_min.distance(canvas_min) > f32::EPSILON
                     || cache.width_px != width_px
                     || cache.height_px != height_px
                     || (cache.min_cell_pixels - self.min_cell_pixels).abs() > f32::EPSILON
@@ -809,23 +999,26 @@ impl TreeMapApp {
 
         let mut cells = Vec::with_capacity(raw_cells.len());
         let mut cell_centers = HashMap::with_capacity(raw_cells.len());
+        let mut cell_centers_by_key = HashMap::with_capacity(raw_cells.len());
 
         for cell in raw_cells {
-            if cell.depth == 0 {
-                continue;
-            }
-
             let rect = egui::Rect::from_min_size(
                 egui::pos2(cell.rect.x, cell.rect.y),
                 egui::vec2(cell.rect.w, cell.rect.h),
             );
 
+            let path = cell.node.path.clone();
+            cell_centers.insert(path.clone(), rect.center());
+            cell_centers_by_key.insert(normalize_path_key(&path), rect.center());
+
+            if cell.depth == 0 {
+                continue;
+            }
+
             if rect.width() < min_cell_pixels || rect.height() < min_cell_pixels {
                 continue;
             }
 
-            let path = cell.node.path.clone();
-            cell_centers.insert(path.clone(), rect.center());
             cells.push(CachedCell {
                 rect,
                 name: cell.node.name.clone(),
@@ -841,10 +1034,12 @@ impl TreeMapApp {
             depth,
             max_nodes,
             min_cell_pixels,
+            canvas_min: canvas_rect.min,
             width_px: canvas_rect.width().round().max(1.0) as u32,
             height_px: canvas_rect.height().round().max(1.0) as u32,
             cells,
             cell_centers,
+            cell_centers_by_key,
         }
     }
 
@@ -974,11 +1169,12 @@ impl TreeMapApp {
         }
 
         let (canvas_rect, canvas_response) =
-            ui.allocate_exact_size(available, egui::Sense::hover());
+            ui.allocate_exact_size(available, egui::Sense::click_and_drag());
+        self.handle_pan_and_zoom(ui.ctx(), &canvas_response);
         let width_px = canvas_rect.width().round().max(1.0) as u32;
         let height_px = canvas_rect.height().round().max(1.0) as u32;
 
-        if self.cache_needs_rebuild(width_px, height_px) {
+        if self.cache_needs_rebuild(canvas_rect.min, width_px, height_px) {
             let Some(scan_result) = self.scan_result.as_ref() else {
                 return;
             };
@@ -1003,21 +1199,29 @@ impl TreeMapApp {
         painter.rect_filled(canvas_rect, 0.0, Color32::from_rgb(26, 30, 34));
 
         for cell in &cache.cells {
-            painter.rect_filled(cell.rect, 0.0, cell.fill);
+            let transformed_rect = self.transform_rect_for_view(cell.rect);
+            if !transformed_rect.intersects(canvas_rect) {
+                continue;
+            }
+
+            painter.rect_filled(transformed_rect, 0.0, cell.fill);
             painter.rect_stroke(
-                cell.rect,
+                transformed_rect,
                 0.0,
                 egui::Stroke::new(1.0, Color32::from_black_alpha(45)),
             );
 
-            if self.show_cell_labels && cell.rect.width() > 95.0 && cell.rect.height() > 20.0 {
+            if self.show_cell_labels
+                && transformed_rect.width() > 95.0
+                && transformed_rect.height() > 20.0
+            {
                 let label_name = self.demo_name(&cell.name, &cell.path, cell.is_dir);
                 let label = format!("{} ({})", label_name, human_size(cell.size));
-                let max_chars = (cell.rect.width() / 7.0).floor().max(6.0) as usize;
+                let max_chars = (transformed_rect.width() / 7.0).floor().max(6.0) as usize;
                 let text = truncate_label(&label, max_chars);
 
                 painter.text(
-                    cell.rect.left_top() + egui::vec2(4.0, 4.0),
+                    transformed_rect.left_top() + egui::vec2(4.0, 4.0),
                     egui::Align2::LEFT_TOP,
                     text,
                     egui::TextStyle::Small.resolve(ui.style()),
@@ -1035,11 +1239,12 @@ impl TreeMapApp {
             let pointer_pos = ui.ctx().input(|input| input.pointer.hover_pos());
 
             pointer_pos.and_then(|pos| {
+                let world_pos = self.screen_to_world(pos);
                 cache
                     .cells
                     .iter()
                     .rev()
-                    .find(|cell| cell.rect.contains(pos))
+                    .find(|cell| cell.rect.contains(world_pos))
                     .map(|cell| HoveredEntry {
                         name: cell.name.clone(),
                         path: cell.path.clone(),
@@ -1093,7 +1298,7 @@ impl eframe::App for TreeMapApp {
 
         if !self.startup_prompted {
             self.startup_prompted = true;
-            self.pick_and_scan();
+            self.pick_startup_paths_and_scan();
         }
 
         self.poll_scan_messages(ctx);
@@ -1118,7 +1323,7 @@ impl eframe::App for TreeMapApp {
                         "请选择一个目录来生成只读大小 Treemap。",
                     ));
                     if ui.button(self.t("Choose directory", "选择目录")).clicked() {
-                        self.pick_and_scan();
+                        self.pick_startup_paths_and_scan();
                     }
                 });
             }
@@ -1331,6 +1536,28 @@ fn time_seed() -> u64 {
 
 fn next_seed(seed: u64) -> u64 {
     seed.wrapping_mul(6364136223846793005).wrapping_add(1)
+}
+
+fn normalize_path_key(path: &std::path::Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+}
+
+fn path_within_root(path: &std::path::Path, root: &std::path::Path) -> bool {
+    let path_key = normalize_path_key(path);
+    let root_key = normalize_path_key(root);
+
+    if path_key == root_key {
+        return true;
+    }
+
+    let mut root_prefix = root_key;
+    if !root_prefix.ends_with('/') {
+        root_prefix.push('/');
+    }
+
+    path_key.starts_with(&root_prefix)
 }
 
 fn build_alias_map(root: &Node) -> HashMap<PathBuf, AliasEntry> {
